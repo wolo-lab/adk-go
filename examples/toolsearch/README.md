@@ -111,7 +111,11 @@ non-packable tools are omitted from search results.
   characters; returned descriptions to 200 bytes without splitting UTF-8 runes.
 - **Query dispatch:** any regex metacharacter selects regex mode, including
   punctuation such as a period or question mark. Invalid regex falls back to a
-  literal case-insensitive match. This is a heuristic, not semantic search.
+  literal case-insensitive match. A regex-mode query that matches nothing and
+  contains whitespace is ranked by BM25 instead, with a note saying so, so
+  "how do I list files?" still finds `list_files` while a pattern such as
+  `^get_.*_record$` that matches nothing returns nothing. This is a heuristic,
+  not semantic search.
 - **Exclusions:** core and already-discovered tools are not returned again.
   If every base tool is core (or the catalog is empty), no search tool is exposed.
   Search remains present after all initially gated tools have been discovered.
