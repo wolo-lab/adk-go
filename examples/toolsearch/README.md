@@ -135,7 +135,7 @@ gated, err := toolsearch.New(baseToolset, toolsearch.Config{
 ```
 
 - **`AgentName`** must match your chosen state namespace and be unique among
-  agents that should not share discoveries.
+  agents that should not share discoveries. It must not contain a colon.
 - **`CoreToolNames`** stay visible without search.
 - **`GatedToolNames`** is an optional sorted name-only advertisement in the search
   description. It does not define or restrict the actual catalog. Omit it when
@@ -221,8 +221,9 @@ catalog changes. Only register trusted skill instructions and resources.
 
 ## State, safety, and scope
 
-Discovery names are stored as a comma-separated string under
-`tool_search:discovered:<AgentName>`. Their lifetime is the session's lifetime,
+Each discovered tool is stored under its own key,
+`tool_search:discovered:<AgentName>:<tool>`, with its discovery position as the
+value. Their lifetime is the session's lifetime,
 not the process's search index. A persistent ADK session service can retain them
 across invocations; this demo intentionally uses in-memory storage.
 Discoveries append in stable order and are not automatically evicted.
@@ -237,9 +238,10 @@ packed tools for the invocation, and an initially all-core catalog has no search
 tool to activate mid-invocation. Restart the invocation when authorization or
 catalog membership changes. Static advertisements can become stale.
 
-Tool-discovery state updates are read-modify-write, not atomic merges. Serialize discovery
-updates for the same agent/session; parallel writers can lose discoveries.
-There is no per-session discovery budget, TTL, or reset tool here.
+One key per tool means discoveries from several function calls in one model
+response are all kept, even though each call writes its own state delta. Calls
+that saw the same prior state can store equal positions, and ties are ordered by
+name. There is no per-session discovery budget, TTL, or reset tool here.
 
 ## Caching is important—and still underexplored
 

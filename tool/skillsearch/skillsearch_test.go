@@ -15,18 +15,28 @@
 package skillsearch
 
 import (
+	"context"
 	"fmt"
 	"iter"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
 
+	"github.com/google/go-cmp/cmp"
+	"google.golang.org/genai"
+
 	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/internal/ranksearch"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/tool"
+	"google.golang.org/adk/v2/tool/functiontool"
 	"google.golang.org/adk/v2/tool/skilltoolset/skill"
 	"google.golang.org/adk/v2/tool/toolconfirmation"
+	"google.golang.org/adk/v2/tool/toolsearch"
 )
 
 type fakeState map[string]any
@@ -94,10 +104,22 @@ func mustLoad(t *testing.T, ts *Toolset, ctx *fakeContext, name string) map[stri
 	return out
 }
 
-func checkDiscovered(t *testing.T, ctx *fakeContext, want string) {
+// checkDiscovered reports whether the state holds exactly the want tools as
+// discovered, at positions matching their order in want.
+func checkDiscovered(t *testing.T, ctx *fakeContext, want ...string) {
 	t.Helper()
-	if got := ctx.state["tool_search:discovered:test"]; got != want {
-		t.Errorf("discovered tools = %v, want %q", got, want)
+	got := map[string]any{}
+	for key, value := range ctx.state {
+		if name, ok := strings.CutPrefix(key, "tool_search:discovered:test:"); ok {
+			got[name] = value
+		}
+	}
+	wantPositions := map[string]any{}
+	for i, name := range want {
+		wantPositions[name] = i
+	}
+	if diff := cmp.Diff(wantPositions, got); diff != "" {
+		t.Errorf("discovered tools mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -239,5 +261,89 @@ func TestSearchLimitsAndActiveExclusion(t *testing.T) {
 	}
 	if got := ts.search(ctx.state, "select:"+strings.Join(names, ",")).Matches; len(got) != 9 {
 		t.Errorf("select search returned %d matches, want 9", len(got))
+	}
+}
+
+// parallelCallModel returns all calls in its first response and records the
+// tools declared in the second request.
+type parallelCallModel struct {
+	calls    []*genai.FunctionCall
+	step     int
+	declared []string
+}
+
+func (*parallelCallModel) Name() string { return "parallel-call-model" }
+
+func (m *parallelCallModel) GenerateContent(_ context.Context, req *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	return func(yield func(*model.LLMResponse, error) bool) {
+		defer func() { m.step++ }()
+		if m.step == 0 {
+			parts := make([]*genai.Part, len(m.calls))
+			for i, c := range m.calls {
+				parts[i] = &genai.Part{FunctionCall: c}
+			}
+			yield(&model.LLMResponse{Content: &genai.Content{Role: genai.RoleModel, Parts: parts}}, nil)
+			return
+		}
+		m.declared = nil
+		for _, t := range req.Config.Tools {
+			for _, d := range t.FunctionDeclarations {
+				m.declared = append(m.declared, d.Name)
+			}
+		}
+		yield(&model.LLMResponse{Content: genai.NewContentFromText("done", genai.RoleModel)}, nil)
+	}
+}
+
+type staticToolset []tool.Tool
+
+func (staticToolset) Name() string                                       { return "static" }
+func (s staticToolset) Tools(agent.ReadonlyContext) ([]tool.Tool, error) { return s, nil }
+
+// TestLoad_ParallelCallsRevealAllTools runs two load_skill calls from one model
+// response through the real runner. Each call gets its own state delta, so the
+// tools revealed by one must survive the other.
+func TestLoad_ParallelCallsRevealAllTools(t *testing.T) {
+	newTool := func(name string) tool.Tool {
+		ft, err := functiontool.New(functiontool.Config{Name: name, Description: name},
+			func(_ agent.Context, _ struct{}) (struct{}, error) { return struct{}{}, nil })
+		if err != nil {
+			t.Fatalf("functiontool.New(%q) error = %v", name, err)
+		}
+		return ft
+	}
+	gated, err := toolsearch.New(staticToolset{newTool("add_numbers"), newTool("multiply_numbers")},
+		toolsearch.Config{AgentName: "calculator"})
+	if err != nil {
+		t.Fatalf("toolsearch.New() error = %v", err)
+	}
+	skills, err := New(t.Context(), skill.NewFileSystemSource(fstest.MapFS{
+		"add/SKILL.md":      &fstest.MapFile{Data: []byte("---\nname: add\ndescription: Add numbers.\n---\nUse the addition tool.")},
+		"multiply/SKILL.md": &fstest.MapFile{Data: []byte("---\nname: multiply\ndescription: Multiply numbers.\n---\nUse the multiplication tool.")},
+	}), Config{AgentName: "calculator", ToolNames: map[string][]string{"add": {"add_numbers"}, "multiply": {"multiply_numbers"}}})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	llm := &parallelCallModel{calls: []*genai.FunctionCall{
+		{ID: "1", Name: "load_skill", Args: map[string]any{"name": "add"}},
+		{ID: "2", Name: "load_skill", Args: map[string]any{"name": "multiply"}},
+	}}
+	a, err := llmagent.New(llmagent.Config{Name: "calculator", Model: llm, Toolsets: []tool.Toolset{gated, skills}})
+	if err != nil {
+		t.Fatalf("llmagent.New() error = %v", err)
+	}
+	r, err := runner.New(runner.Config{AppName: "app", Agent: a, SessionService: session.InMemoryService(), AutoCreateSession: true})
+	if err != nil {
+		t.Fatalf("runner.New() error = %v", err)
+	}
+	for _, err := range r.Run(t.Context(), "user", "session", genai.NewContentFromText("go", genai.RoleUser), agent.RunConfig{}) {
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	}
+	for _, want := range []string{"add_numbers", "multiply_numbers"} {
+		if !slices.Contains(llm.declared, want) {
+			t.Errorf("declared tools = %v, want %q included", llm.declared, want)
+		}
 	}
 }
